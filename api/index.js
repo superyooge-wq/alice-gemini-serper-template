@@ -61,7 +61,7 @@ async function askRouterAI(text, history, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
 
   try {
-const response = await fetch("https://routerai.ru", {
+    const response = await fetch("https://routerai.ru", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
