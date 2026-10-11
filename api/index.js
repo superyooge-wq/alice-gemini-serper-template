@@ -1,15 +1,14 @@
 const DEFAULT_MODEL = "deepseek/deepseek-chat:online";
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
-const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const GEMINI_TIMEOUT_MS = 2500;
+const MAX_HISTORY_MESSAGES = 6;
+const MAX_HISTORY_MESSAGE_CHARS = 1000;
+const MAX_ALICE_TEXT = 1000;
+const TOTAL_RESPONSE_BUDGET_MS = 3500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Если вопрос требует актуальных данных, опирайся на результаты поиска; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -31,17 +30,7 @@ function fitAliceText(value) {
     .trim();
 
   if (text.length <= MAX_ALICE_TEXT) return text || "Не удалось подготовить ответ.";
-
-  const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
-  const sentenceEnd = Math.max(
-    candidate.lastIndexOf(". "),
-    candidate.lastIndexOf("! "),
-    candidate.lastIndexOf("? ")
-  );
-  if (sentenceEnd >= 300) return candidate.slice(0, sentenceEnd + 1).trim();
-
-  const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+  return text.slice(0, MAX_ALICE_TEXT - 3) + "...";
 }
 
 function safeHistory(history) {
@@ -52,29 +41,13 @@ function safeHistory(history) {
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
 
-async function fetchJson(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
-    return { response, data };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function askRouterAI(text, history, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+  if (!key) throw new Error("MISSING_KEY");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-
-  // Формируем сообщения в формате OpenAI API
   const messages = [{ role: "system", content: SYSTEM_PROMPT }];
   
-  // Добавляем историю
   safeHistory(history).forEach(item => {
     messages.push({
       role: item.role === "model" ? "assistant" : "user",
@@ -82,12 +55,13 @@ async function askRouterAI(text, history, timeoutMs) {
     });
   });
   
-  // Добавляем текущий запрос
   messages.push({ role: "user", content: text });
 
-  const { response, data } = await fetchJson(
-    "https://routerai.ru",
-    {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+
+  try {
+    const response = await fetch("https://routerai.ru", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -97,41 +71,22 @@ async function askRouterAI(text, history, timeoutMs) {
         model: model,
         messages: messages,
         temperature: 0.5,
-        max_tokens: 240
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
+        max_tokens: 250
+      }),
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("RouterAI request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
+    if (!response.ok) {
+      throw new Error(`ROUTER_API_ERROR_${response.status}`);
+    }
 
-  const answer = data?.choices?.[0]?.message?.content?.trim();
-
-  if (!answer) {
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  return answer;
-}
-
-function errorForUser(error) {
-  switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте токен в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться. Проверьте API-ключ RouterAI в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Баланс в RouterAI исчерпан или превышен лимит. Проверьте личный кабинет.";
-    case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
-    default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+    const data = await response.json();
+    const answer = data?.choices?.[0]?.message?.content?.trim();
+    
+    if (!answer) throw new Error("EMPTY_RESPONSE");
+    return answer;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -139,37 +94,33 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-routerai-webhook",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      service: "alice-routerai",
+      message: "Ready for Yandex Dialogs."
     });
   }
 
   if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+  
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
 
   if (!text) {
     return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+      "Привет! Я готова ответить на любой вопрос с помощью большой нейросети. Что хотите узнать?",
       false,
       oldHistory
     ));
   }
 
   try {
-    const answer = await askRouterAI(
-      text,
-      oldHistory,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200))
-    );
-
+    const answer = await askRouterAI(text, oldHistory, remainingMs());
+    
     const history = [
       ...oldHistory,
       { role: "user", text },
@@ -178,8 +129,15 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    console.error("Handler error:", error);
-    return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
+    console.error("Error details:", error.message);
+    let userMessage = "Ой, что-то пошло не так у ИИ-сервера. Попробуйте еще раз.";
+    if (error.message === "MISSING_KEY") {
+      userMessage = "Ошибка настройки: отсутствует API-ключ в переменных Vercel.";
+    } else if (error.message.includes("ROUTER_API_ERROR_401")) {
+      userMessage = "Ошибка авторизации: ваш API-ключ RouterAI недействителен или введен неверно.";
+    } else if (error.message.includes("ROUTER_API_ERROR_402")) {
+      userMessage = "Недостаточно средств. Пожалуйста, проверьте баланс вашего аккаунта RouterAI.";
+    }
+    return res.status(200).json(aliceResponse(userMessage, false, oldHistory));
   }
 }
-
